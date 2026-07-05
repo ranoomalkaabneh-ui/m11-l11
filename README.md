@@ -115,3 +115,8 @@ Open a PR within your fork. The PR description must include:
 This repository is provided for educational use only. See [LICENSE](LICENSE) for terms.
 
 You may clone and modify this repository for personal learning and practice, and reference code you wrote here in your professional portfolio. Redistribution outside this course is not permitted.
+
+
+## Observability
+
+This service includes three Prometheus metric families for monitoring API behavior: `requests_total`, a counter labeled by `path` and `status` to track request volume and response codes; `request_latency_seconds`, a histogram labeled by `path` to measure request duration; and `inflight_requests`, a gauge that tracks how many requests are currently being processed. The latency histogram uses the default Prometheus buckets, which are suitable for general HTTP request latency monitoring without custom bucket configuration. To read the metrics, start the FastAPI service and open `/metrics`; Prometheus-formatted metric samples will be exposed there for scraping or manual inspection.

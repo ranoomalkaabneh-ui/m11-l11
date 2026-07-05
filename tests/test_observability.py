@@ -1,37 +1,61 @@
-"""YOUR tests for the observability layer.
+"""YOUR tests for the observability layer."""
 
-Per the lab guide, write at least 3 substantive tests, each with at least
-1 assertion. The autograder enforces only the structure (3+ test functions,
-each with an `assert` and a non-stub body); the specific behaviors you
-choose to verify are up to you.
+import json
+import logging
 
-You name the tests, you decide what to assert, you choose the test
-strategy (TestClient + header inspection? caplog + log parsing?
-/metrics scrape + counter delta?). The placeholders below show one
-possible split (one test per middleware), but you are free to pick any
-three behaviors that exercise meaningful properties of your
-instrumentation -- e.g. test that the request-id flows across two
-sequential requests with distinct ids, test that the metrics counter
-reflects a 500 response status correctly, test that the structured log
-line carries the X-Request-ID matching the response header.
+from fastapi.testclient import TestClient
 
-The autograder does not import your test function names; rename them
-freely.
-"""
+from api.main import app
 
-import pytest
+
+client = TestClient(app)
 
 
 def test_one():
-    # TODO: write a meaningful test of your observability layer here.
-    pytest.fail("Not implemented -- write your test here")
+    """RequestIdMiddleware adds an X-Request-ID response header."""
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert "x-request-id" in response.headers
+    assert len(response.headers["x-request-id"]) >= 8
 
 
 def test_two():
-    # TODO: write a meaningful test of your observability layer here.
-    pytest.fail("Not implemented -- write your test here")
+    """The /metrics endpoint exposes the custom Prometheus metrics."""
+    client.get("/healthz")
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+
+    body = response.text
+    assert "requests_total" in body
+    assert "request_latency_seconds" in body
+    assert "inflight_requests" in body
 
 
-def test_three():
-    # TODO: write a meaningful test of your observability layer here.
-    pytest.fail("Not implemented -- write your test here")
+def test_three(caplog):
+    """StructuredLoggingMiddleware emits a parseable JSON log line."""
+    with caplog.at_level(logging.INFO, logger="m11.api"):
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+
+    matching_logs = []
+
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except json.JSONDecodeError:
+            continue
+
+        required_keys = {"request_id", "path", "status", "latency_ms"}
+        if required_keys.issubset(payload):
+            matching_logs.append(payload)
+
+    assert matching_logs
+
+    log = matching_logs[-1]
+    assert log["path"] == "/healthz"
+    assert log["status"] == 200
+    assert len(log["request_id"]) >= 8
+    assert isinstance(log["latency_ms"], float)

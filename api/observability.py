@@ -37,43 +37,149 @@ Methodology pointers:
   - See Common Pitfalls #1-#4 in the lab guide.
 """
 
-# TODO: import Counter, Histogram, Gauge from prometheus_client.
-
-# TODO: declare the three metric families at module scope.
-#
-#   requests_total           — Counter, labels (path, status)
-#   request_latency_seconds  — Histogram, label (path); use the default
-#                              Prometheus latency buckets.
-#   inflight_requests        — Gauge, no labels.
-#
-# Do not over-label — see the cardinality discussion in the M11 reading.
+"""Observability layer for the M10 backend."""
 
 
-# TODO: implement RequestIdMiddleware (ASGI middleware class).
-#
-#   - __init__(self, app): store app.
-#   - __call__(self, scope, receive, send): generate a request id, store it
-#     somewhere the logging layer can read (a ContextVar is the standard
-#     pattern), and arrange for the outbound response to carry an
-#     `X-Request-ID` header.
-#
-#   The autograder asserts the response header is present and at least 8
-#   characters long.
+
+import json
+import logging
+import time
+import uuid
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from typing import Any, Callable, MutableMapping
+
+from prometheus_client import Counter, Gauge, Histogram
 
 
-# TODO: implement StructuredLoggingMiddleware (ASGI middleware class).
-#
-#   - On response, emit one JSON line containing the keys:
-#       request_id, path, status, latency_ms
-#     plus any other keys you find useful. The autograder asserts the four
-#     keys above are present and parseable as JSON.
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 
 
-# TODO: implement MetricsMiddleware (ASGI middleware class).
-#
-#   - On request: increment inflight_requests.
-#   - Around the route handler: time the request.
-#   - On response: increment requests_total with the (path, status) label
-#     pair, observe the latency histogram, decrement inflight_requests.
-#
-#   Do not include high-cardinality labels (no user id, no query string).
+requests_total = Counter(
+    "requests_total",
+    "Total HTTP requests by path and status.",
+    ["path", "status"],
+)
+
+request_latency_seconds = Histogram(
+    "request_latency_seconds",
+    "HTTP request latency in seconds by path.",
+    ["path"],
+)
+
+inflight_requests = Gauge(
+    "inflight_requests",
+    "Number of HTTP requests currently in flight.",
+)
+
+
+_logger = logging.getLogger("m11.api")
+
+
+def _path_label(scope: MutableMapping[str, Any]) -> str:
+    """Return the parameterized route path when available, else raw path."""
+    route = scope.get("route")
+    if route is not None and hasattr(route, "path"):
+        return route.path
+    return scope.get("path", "")
+
+
+class RequestIdMiddleware:
+    """Generate a request id and attach it to the response."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = uuid.uuid4().hex
+        token = request_id_var.set(request_id)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("utf-8")))
+                message["headers"] = headers
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            request_id_var.reset(token)
+
+
+class StructuredLoggingMiddleware:
+    """Emit one structured JSON log line per HTTP request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start = time.perf_counter()
+        status = 500
+
+        async def send_wrapper(message):
+            nonlocal status
+
+            if message["type"] == "http.response.start":
+                status = message["status"]
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            latency_ms = (time.perf_counter() - start) * 1000
+
+            log_line = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": "INFO",
+                "request_id": request_id_var.get(),
+                "path": _path_label(scope),
+                "status": status,
+                "latency_ms": round(latency_ms, 3),
+            }
+
+            _logger.info(json.dumps(log_line))
+
+
+class MetricsMiddleware:
+    """Record Prometheus metrics for each HTTP request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        inflight_requests.inc()
+        start = time.perf_counter()
+        status = 500
+
+        async def send_wrapper(message):
+            nonlocal status
+
+            if message["type"] == "http.response.start":
+                status = message["status"]
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            elapsed = time.perf_counter() - start
+            path = _path_label(scope)
+
+            requests_total.labels(path=path, status=str(status)).inc()
+            request_latency_seconds.labels(path=path).observe(elapsed)
+            inflight_requests.dec()
